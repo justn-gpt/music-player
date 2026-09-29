@@ -14,17 +14,15 @@ const {
   HeadObjectCommand,
 } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 管理密码（与原来一致）
+// 管理密码
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 
 // ===== R2 (S3 兼容) 配置 =====
-// R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY: 在 CF Dashboard -> R2 -> 管理 API 令牌 中创建
-// R2_BUCKET: 桶名
-// R2_PUBLIC_URL: 桶绑定的公开访问域名，例如 https://music-cdn.yourdomain.com（不要带结尾斜杠）
 const R2_BUCKET = process.env.R2_BUCKET;
 const R2_PUBLIC_URL = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
 
@@ -38,7 +36,6 @@ const s3 = new S3Client({
 });
 
 const ALLOWED_EXT = ['.mp3', '.wav', '.flac', '.m4a'];
-// 与原项目一致的文件名合法性校验
 const FILENAME_REGEX = /^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5\s\-_.]+\.(mp3|wav|flac|m4a)$/;
 
 function getContentType(ext) {
@@ -66,7 +63,6 @@ function buildPublicUrl(key) {
   return `${R2_PUBLIC_URL}/${encodeURIComponent(key)}`;
 }
 
-// 列举桶内全部对象（自动翻页）
 async function listAllObjects() {
   let objects = [];
   let continuationToken;
@@ -83,15 +79,11 @@ async function listAllObjects() {
   return objects.filter((o) => ALLOWED_EXT.includes(path.extname(o.Key).toLowerCase()));
 }
 
-// 元数据缓存（存在性/大小），TTL 2 小时
 const cache = new NodeCache({ stdTTL: 7200, checkperiod: 120, maxKeys: 500 });
-
-// 流量统计（现在仅统计经过 Node 的管理类请求，播放/下载流量已转移到 R2，不再计入）
 const stats = { totalBytes: 0, requests: 0 };
 
 app.set('json spaces', 2);
 
-// CORS 中间件
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -99,20 +91,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// 解析 JSON 请求体（前端删除功能用 JSON body 发送参数，之前少了这一步导致读不到）
+// 解析 JSON 请求体
 app.use(express.json());
 
-// 前端静态文件（网页界面）
+// 前端静态文件
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 上传中间件：内存存储，拿到 buffer 后直接传 R2，不落本地盘
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
+  limits: { fileSize: 500 * 1024 * 1024 },
 });
 
-// ===== 直链 / 播放：302 跳转到 R2 公开地址 =====
-// 播放流量完全由 R2 承担，Node 只做一次存在性校验（走缓存）
+// ===== 直链 / 播放 =====
 app.get('/music/:filename', async (req, res) => {
   const filename = req.params.filename;
 
@@ -135,7 +125,6 @@ app.get('/music/:filename', async (req, res) => {
   res.redirect(302, buildPublicUrl(filename));
 });
 
-// 统计接口
 app.get('/stats', (req, res) => {
   res.json({
     totalTransferred: bytes(stats.totalBytes),
@@ -144,7 +133,7 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// ===== 从远程 URL 下载音乐，直接流式写入 R2（不经过本地磁盘）=====
+// ===== 从远程 URL 下载音乐（需要密码）=====
 app.get('/api/download', async (req, res) => {
   const { url, name, password } = req.query;
 
@@ -167,12 +156,11 @@ app.get('/api/download', async (req, res) => {
     return res.status(400).json({ error: 'filename is wrong' });
   }
 
-  // 已存在则直接返回
   try {
     await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: fullName }));
     return res.status(200).json({ warning: 'The song already exists', url: buildPublicUrl(fullName) });
   } catch (err) {
-    // 不存在，继续走下载流程
+    // 不存在，继续
   }
 
   res.json({
@@ -182,7 +170,6 @@ app.get('/api/download', async (req, res) => {
     futureUrl: buildPublicUrl(fullName),
   });
 
-  // 后台异步：拉取远程文件并流式上传到 R2
   try {
     const response = await axios({
       method: 'GET',
@@ -209,7 +196,7 @@ app.get('/api/download', async (req, res) => {
   }
 });
 
-// ===== 直接上传本地文件到 R2 =====
+// ===== 直接上传本地文件到 R2（经过 Node 中转，适合小文件，需要密码）=====
 app.post('/api/upload', upload.single('music'), async (req, res) => {
   try {
     const { password } = req.body;
@@ -250,6 +237,40 @@ app.post('/api/upload', upload.single('music'), async (req, res) => {
   }
 });
 
+// ===== 新增：获取预签名上传链接（浏览器直传R2，不经过Node中转，需要密码）=====
+app.get('/api/upload-url', async (req, res) => {
+  try {
+    const { filename, password } = req.query;
+
+    if (password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid password' });
+    }
+
+    if (!filename || !FILENAME_REGEX.test(filename)) {
+      return res.status(400).json({ error: 'Invalid or missing filename' });
+    }
+
+    const ext = path.extname(filename).toLowerCase();
+
+    const command = new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: filename,
+      ContentType: getContentType(ext),
+    });
+
+    // 10 分钟有效期，够传一首歌了
+    const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 600 });
+
+    res.json({
+      success: true,
+      uploadUrl,
+      publicUrl: buildPublicUrl(filename),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to generate upload URL', details: err.message });
+  }
+});
+
 // ===== 获取音乐列表 =====
 app.get('/api/music/list', async (req, res) => {
   try {
@@ -271,7 +292,6 @@ app.get('/api/music/list', async (req, res) => {
 
 // ===== 删除音乐（需要管理密码）=====
 app.post('/api/delete/music', async (req, res) => {
-  // 前端用 JSON body 发送参数，这里同时兼容 query string，防止以后有别的调用方式
   const { names, password, all } = { ...req.query, ...req.body };
 
   if (password !== ADMIN_PASSWORD) {
@@ -301,7 +321,6 @@ app.post('/api/delete/music', async (req, res) => {
       return res.status(404).json({ error: 'No matching songs found' });
     }
 
-    // R2/S3 一次最多删除 1000 个对象，个人使用场景足够
     await s3.send(
       new DeleteObjectsCommand({
         Bucket: R2_BUCKET,
@@ -321,7 +340,6 @@ app.post('/api/delete/music', async (req, res) => {
   }
 });
 
-// 启动服务器
 app.listen(PORT, () => {
   console.log(`music service is running on port ${PORT}`);
   if (!R2_PUBLIC_URL) {
