@@ -376,7 +376,7 @@ class PlayerCreator {
             });
     }
 
-    // 处理上传本地文件
+    // 处理上传本地文件（浏览器直传R2，不经过Node服务器中转）
     handleUploadSong() {
         const fileInput = document.getElementById('local-file');
         const file = fileInput.files[0];
@@ -392,23 +392,29 @@ class PlayerCreator {
             return;
         }
 
-        const formData = new FormData();
-        formData.append('music', file);
-        formData.append('password', password);
-
         const wasPlaying = !this.audio.paused;
         const currentTime = this.audio.currentTime;
         const currentSongIndex = this.song_index;
 
-        $.ajax({
-            url: '/api/upload',
-            method: 'POST',
-            data: formData,
-            processData: false,
-            contentType: false,
-            success: (response) => {
-                alert(response.success ? '上传成功' : response.error || '上传失败');
-                if (response.success) {
+        // 第一步：问服务器要一个R2的预签名上传链接
+        $.get('/api/upload-url', { filename: file.name, password })
+            .done(response => {
+                if (!response.success) {
+                    alert(response.error || '获取上传链接失败');
+                    return;
+                }
+
+                // 第二步：浏览器直接把文件PUT给R2，不经过Armbian
+                fetch(response.uploadUrl, {
+                    method: 'PUT',
+                    body: file,
+                    headers: { 'Content-Type': file.type || 'application/octet-stream' }
+                })
+                .then(uploadRes => {
+                    if (!uploadRes.ok) {
+                        throw new Error('R2直传失败，状态码: ' + uploadRes.status);
+                    }
+                    alert('上传成功');
                     fileInput.value = '';
                     this.musics = new Musics();
                     setTimeout(() => {
@@ -421,12 +427,14 @@ class PlayerCreator {
                         }
                         this.hideManagementModal();
                     }, 1000);
-                }
-            },
-            error: (xhr) => {
-                alert('上传失败: ' + (xhr.responseJSON?.error || xhr.statusText));
-            }
-        });
+                })
+                .catch(err => {
+                    alert('上传失败: ' + err.message);
+                });
+            })
+            .fail(error => {
+                alert('获取上传链接失败: ' + (error.responseJSON?.error || error.statusText));
+            });
     }
 
     // 处理删除歌曲
