@@ -99,6 +99,9 @@ app.use((req, res, next) => {
   next();
 });
 
+// 解析 JSON 请求体（前端删除功能用 JSON body 发送参数，之前少了这一步导致读不到）
+app.use(express.json());
+
 // 前端静态文件（网页界面）
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -143,7 +146,12 @@ app.get('/stats', (req, res) => {
 
 // ===== 从远程 URL 下载音乐，直接流式写入 R2（不经过本地磁盘）=====
 app.get('/api/download', async (req, res) => {
-  const { url, name } = req.query;
+  const { url, name, password } = req.query;
+
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid password' });
+  }
+
   if (!url) {
     return res.status(400).json({ error: 'Please provide a music url' });
   }
@@ -204,6 +212,11 @@ app.get('/api/download', async (req, res) => {
 // ===== 直接上传本地文件到 R2 =====
 app.post('/api/upload', upload.single('music'), async (req, res) => {
   try {
+    const { password } = req.body;
+    if (password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid password' });
+    }
+
     const file = req.file;
     if (!file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -258,7 +271,8 @@ app.get('/api/music/list', async (req, res) => {
 
 // ===== 删除音乐（需要管理密码）=====
 app.post('/api/delete/music', async (req, res) => {
-  const { names, password, all } = req.query;
+  // 前端用 JSON body 发送参数，这里同时兼容 query string，防止以后有别的调用方式
+  const { names, password, all } = { ...req.query, ...req.body };
 
   if (password !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Unauthorized: Invalid password' });
