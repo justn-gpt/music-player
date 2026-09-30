@@ -376,7 +376,7 @@ class PlayerCreator {
             });
     }
 
-    // 处理上传本地文件（浏览器直传R2，不经过Node服务器中转）
+    // 处理上传本地文件（浏览器直传R2，带进度条）
     handleUploadSong() {
         const fileInput = document.getElementById('local-file');
         const file = fileInput.files[0];
@@ -396,6 +396,10 @@ class PlayerCreator {
         const currentTime = this.audio.currentTime;
         const currentSongIndex = this.song_index;
 
+        const progressContainer = document.getElementById('upload-progress-container');
+        const progressBar = document.getElementById('upload-progress-bar');
+        const progressText = document.getElementById('upload-progress-text');
+
         // 第一步：问服务器要一个R2的预签名上传链接
         $.get('/api/upload-url', { filename: file.name, password })
             .done(response => {
@@ -404,33 +408,50 @@ class PlayerCreator {
                     return;
                 }
 
-                // 第二步：浏览器直接把文件PUT给R2，不经过Armbian
-                fetch(response.uploadUrl, {
-                    method: 'PUT',
-                    body: file,
-                    headers: { 'Content-Type': file.type || 'application/octet-stream' }
-                })
-                .then(uploadRes => {
-                    if (!uploadRes.ok) {
-                        throw new Error('R2直传失败，状态码: ' + uploadRes.status);
+                // 第二步：用 XHR 直传R2，这样才能拿到上传进度
+                progressContainer.style.display = 'block';
+                progressBar.value = 0;
+                progressText.textContent = '0%';
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('PUT', response.uploadUrl);
+                xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        progressBar.value = percent;
+                        progressText.textContent = percent + '%';
                     }
-                    alert('上传成功');
-                    fileInput.value = '';
-                    this.musics = new Musics();
-                    setTimeout(() => {
-                        this.song_index = currentSongIndex;
-                        this.renderSongList();
-                        this.renderSongStyle();
-                        if (wasPlaying) {
-                            this.audio.currentTime = currentTime;
-                            this.audio.play();
-                        }
-                        this.hideManagementModal();
-                    }, 1000);
-                })
-                .catch(err => {
-                    alert('上传失败: ' + err.message);
-                });
+                };
+
+                xhr.onload = () => {
+                    progressContainer.style.display = 'none';
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        alert('上传成功');
+                        fileInput.value = '';
+                        this.musics = new Musics();
+                        setTimeout(() => {
+                            this.song_index = currentSongIndex;
+                            this.renderSongList();
+                            this.renderSongStyle();
+                            if (wasPlaying) {
+                                this.audio.currentTime = currentTime;
+                                this.audio.play();
+                            }
+                            this.hideManagementModal();
+                        }, 1000);
+                    } else {
+                        alert('R2直传失败，状态码: ' + xhr.status);
+                    }
+                };
+
+                xhr.onerror = () => {
+                    progressContainer.style.display = 'none';
+                    alert('上传失败：网络错误');
+                };
+
+                xhr.send(file);
             })
             .fail(error => {
                 alert('获取上传链接失败: ' + (error.responseJSON?.error || error.statusText));
